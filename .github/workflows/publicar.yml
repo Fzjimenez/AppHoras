@@ -1,0 +1,77 @@
+name: Publicar AppHoras
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: apphoras-vm
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  publicar:
+    if: github.repository == 'Fzjimenez/AppHoras' && !github.event.deleted
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Conectar con Azure
+        uses: azure/login@a641126d1b8aa4d1fa005f4f92df94a3a4c4c906 # v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Publicar el commit y confirmar la respuesta de la app
+        shell: bash
+        env:
+          SUSCRIPCION: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          ejecucion="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          recurso="/subscriptions/$SUSCRIPCION/resourceGroups/RG-AppHoras/providers/Microsoft.Compute/virtualMachines/VM-AppHoras/runCommands/AppHorasPublicarMain"
+          uri="https://management.azure.com$recurso?api-version=2025-04-01"
+
+          remoto=$(cat <<EOF
+          #!/bin/sh
+          exec 2>&1
+          /usr/local/sbin/publicar-apphoras --revision '$GITHUB_SHA'
+          codigo=\$?
+          echo "APPHORAS_FIN $ejecucion \$codigo"
+          exit "\$codigo"
+          EOF
+          )
+          cuerpo=$(jq -n --arg script "$remoto" \
+            '{properties: {source: {script: $script}, asyncExecution: false, timeoutInSeconds: 1200}}')
+          az rest --method patch --url "$uri" --body "$cuerpo" --output none
+
+          # Esperar solo el resultado de esta ejecución. Una respuesta anterior puede seguir visible.
+          limite=$((SECONDS + 1500))
+          while (( SECONDS < limite )); do
+            vista=$(az rest --method get --url "$uri&%24expand=instanceView" \
+              --query properties.instanceView --output json)
+            salida=$(jq -r '.output // ""' <<< "$vista" | tr -d '\r')
+            if grep -qF "APPHORAS_FIN $ejecucion " <<< "$salida"; then
+              if ! grep -qxF "APPHORAS_FIN $ejecucion 0" <<< "$salida"; then
+                sed 's/^/VM | /' <<< "$salida" >&2
+                exit 1
+              fi
+              if grep -qxF "APPHORAS_PUBLICADA $GITHUB_SHA" <<< "$salida"; then
+                echo "AppHoras sirve el commit $GITHUB_SHA." | tee -a "$GITHUB_STEP_SUMMARY"
+              elif grep -qxF "APPHORAS_SUPERADA $GITHUB_SHA" <<< "$salida"; then
+                echo "Hay un commit más reciente en main. Este despliegue se omitió." | tee -a "$GITHUB_STEP_SUMMARY"
+              else
+                echo "La VM terminó sin confirmar la revisión publicada." >&2
+                exit 1
+              fi
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Azure no confirmó esta ejecución de AppHoras dentro del plazo." >&2
+          exit 1
